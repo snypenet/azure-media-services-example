@@ -120,6 +120,24 @@ static AssetFilter GetAssetFilter()
     return drvAssetFilter;
 }
 
+static async Task<T?> Execute<T>(Func<Task<T>> action) where T : class
+{
+    try
+    {
+        var result = await action();
+        return result;
+    }
+    catch(Microsoft.Azure.Management.Media.Models.ErrorResponseException ex)
+    {
+        if (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+
+        throw;
+    }
+}
+
 static (string hlsManifest, string dashManifest) BuildManifestPaths(string scheme, string hostname, string streamingLocatorId, string manifestName)
 {
     const string hlsFormat = "format=m3u8-cmaf";
@@ -142,36 +160,66 @@ static async Task Run()
                    .Build();
 
     var mediaClient = await GetMediaClient(config);
+
+    Console.WriteLine("Getting Media Service");
     var mediaService = await mediaClient.Mediaservices.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"]);
 
     var liveEventAccessControl = GetLiveEventAccessControl();
     var previewEventAccessControl = GetLiveEventPreviewAccessControl();
 
-    string accessToken = Guid.NewGuid().ToString().Replace("-", "");
-    var liveEvent = CreateLiveEvent(accessToken, mediaService.Location, liveEventAccessControl, previewEventAccessControl);
     string liveEventName = "SomeEventName";
-    await mediaClient.LiveEvents.CreateAsync(config["AZURE_RESOURCE_GROUP"], 
-        config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], 
-        liveEventName, 
-        liveEvent, 
-        autoStart: false);
+    var liveEvent = await Execute(async () => await mediaClient.LiveEvents.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName));
+    if (liveEvent == null)
+    {
+        Console.WriteLine("Creating Live Event");
+        string accessToken = Guid.NewGuid().ToString().Replace("-", "");
+        liveEvent = CreateLiveEvent(accessToken, mediaService.Location, liveEventAccessControl, previewEventAccessControl);
+        await mediaClient.LiveEvents.CreateAsync(config["AZURE_RESOURCE_GROUP"],
+            config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
+            liveEventName,
+            liveEvent,
+            autoStart: false);
+    }    
+    else
+    {
+        Console.WriteLine("Live Event already exists");
+    }
 
-    string assetName = "SomeAssetName";
+    string id = Guid.NewGuid().ToString().Replace("-", "");
+
+    string assetName = "SomeAssetName-" + id;
+    string outputAssetName = assetName + "_output";
+
     // media to record live output
+    Console.WriteLine("Creating Asset");
     var asset = await mediaClient.Assets.CreateOrUpdateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], assetName, new Asset());
+    var outputAssest = await mediaClient.Assets.CreateOrUpdateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], outputAssetName, new Asset());
 
     string manifestName = "SomeManifestName";
-    var liveOutput = new LiveOutput(asset.Name, TimeSpan.FromHours(1), manifestName: manifestName);
-
     string liveOutputName = "SomeLiveoutputName";
+
+    var liveOutput = await Execute(async () => await mediaClient.LiveOutputs.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName, liveOutputName));
+    if (liveOutput != null)
+    {
+        Console.WriteLine("Deleting existing Live Output");
+        await mediaClient.LiveOutputs.DeleteAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName, liveOutputName);
+    }
+
+    Console.WriteLine("Creating Live Output");
+    liveOutput = new LiveOutput(asset.Name, TimeSpan.FromHours(1), manifestName: manifestName);
     await mediaClient.LiveOutputs.CreateAsync(
         config["AZURE_RESOURCE_GROUP"],
         config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
         liveEventName,
         liveOutputName,
         liveOutput);
+    
 
-    await mediaClient.LiveEvents.StartAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName);
+    if (liveEvent.ResourceState != LiveEventResourceState.Running)
+    {
+        Console.WriteLine("Starting Live Event");
+        await mediaClient.LiveEvents.StartAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName);
+    }
 
     // refresh live event object
     liveEvent = await mediaClient.LiveEvents.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName);
@@ -181,29 +229,38 @@ static async Task Run()
     Console.WriteLine("Press ENTER to continue");
     Console.ReadLine();
 
-    string assetFilterName = "SomeAssetFilter";
-    var assetFilter = GetAssetFilter();
-    assetFilter = await mediaClient.AssetFilters.CreateOrUpdateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
-                    assetName, assetFilterName, assetFilter);
+    string assetFilterName = "SomeAssetFilter-" + id;
+    Console.WriteLine("Creating Asset Filter");
+        var assetFilter = GetAssetFilter();
+        await mediaClient.AssetFilters.CreateOrUpdateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
+                        assetName, assetFilterName, assetFilter);
 
-    string locatorName = "LocatorName";
+    string locatorName = "LocatorName-" + id;
+
+    Console.WriteLine("Creating Locator");
     var locator = await mediaClient.StreamingLocators.CreateAsync(config["AZURE_RESOURCE_GROUP"],
-        config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
-        locatorName,
-        new StreamingLocator
-        {
-            AssetName = assetName,
-            StreamingPolicyName = PredefinedStreamingPolicy.ClearStreamingOnly,
-            Filters = new List<string>
-                {
-                    assetFilterName
-                }   // Associate the dvr filter with StreamingLocator.
-        });
+    config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"],
+    locatorName,
+    new StreamingLocator
+    {
+        AssetName = assetName,
+        StreamingPolicyName = PredefinedStreamingPolicy.ClearStreamingOnly,
+        Filters = new List<string>
+            {
+                assetFilterName
+            }   // Associate the dvr filter with StreamingLocator.
+    });
 
     string endpointName = "default";
-    var streamingEndpoint = await mediaClient.StreamingEndpoints.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], endpointName);
+    var streamingEndpoint = await Execute(async () => await mediaClient.StreamingEndpoints.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], endpointName));
+    if (streamingEndpoint == null)
+    {
+        streamingEndpoint = await mediaClient.StreamingEndpoints.CreateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], endpointName, new StreamingEndpoint());
+    }
+    
     if (streamingEndpoint.ResourceState != StreamingEndpointResourceState.Running)
     {
+        Console.WriteLine("Starting Streaming Endpoint");
         await mediaClient.StreamingEndpoints.StartAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], endpointName);
     }
 
@@ -213,6 +270,38 @@ static async Task Run()
     }
 
     var (hlsManifest, dashManifest) = BuildManifestPaths("https", streamingEndpoint.HostName, locator.StreamingLocatorId.Value.ToString(), manifestName);
+
+    Console.WriteLine($"HLS: {hlsManifest}");
+    Console.WriteLine($"DASH: {dashManifest}");
+    Console.WriteLine("Press ENTER to shutdown stream....");
+    Console.ReadLine();
+
+    Console.WriteLine("Stopping Streaming Endpoint");
+    await mediaClient.StreamingEndpoints.StopAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], endpointName);
+
+    Console.WriteLine("Stopping Live Event");
+    await mediaClient.LiveEvents.StopAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName);
+
+    Console.WriteLine("Deleting Live Output");
+    await mediaClient.LiveOutputs.DeleteAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], liveEventName, liveOutputName);
+
+    string transformName = "tomp4singlebrate";
+    string jobName = transformName + id;
+    var job = await mediaClient.Jobs.CreateAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], transformName, jobName, new Job(
+        new JobInputAsset(assetName),
+        outputs: new List<JobOutput> { new JobOutputAsset(outputAssetName) }
+    ));
+
+    Console.WriteLine("Converting Output to MP4");
+    const int UpperLimit = 300;
+    int count = 0;
+    while (job.State != JobState.Finished && count++ <= UpperLimit)
+    {
+        job = await mediaClient.Jobs.GetAsync(config["AZURE_RESOURCE_GROUP"], config["AZURE_MEDIA_SERVICES_ACCOUNT_NAME"], transformName, jobName);
+        await Task.Delay(1000);
+    }
+
+    Console.WriteLine($"Job State: {job.State}");
 }
 
 await Run();
